@@ -40,6 +40,9 @@ enum editorKey {
   BACKSPACE = 127, ARROW_LEFT = 1000, ARROW_RIGHT, ARROW_UP, ARROW_DOWN,
   DEL_KEY, HOME_KEY, END_KEY, PAGE_UP, PAGE_DOWN,
   CTRL_ARROW_LEFT, CTRL_ARROW_RIGHT, CTRL_ARROW_UP, CTRL_ARROW_DOWN,
+  SHIFT_ARROW_LEFT, SHIFT_ARROW_RIGHT, SHIFT_ARROW_UP, SHIFT_ARROW_DOWN,
+  SHIFT_HOME_KEY, SHIFT_END_KEY,
+  CTRL_SHIFT_ARROW_LEFT, CTRL_SHIFT_ARROW_RIGHT,
   CTRL_DEL_KEY,
 };
 enum editorHighlight {
@@ -122,32 +125,59 @@ int editorReadKey() {
         if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
         if (seq[2] == '~') {
           switch (seq[1]) {
-          case '1': return HOME_KEY; case '3': return DEL_KEY;
-          case '4': return END_KEY; case '5': return PAGE_UP;
-          case '6': return PAGE_DOWN; case '7': return HOME_KEY;
-          case '8': return END_KEY;
+            case '1': return HOME_KEY;
+            case '3': return DEL_KEY;
+            case '4': return END_KEY;
+            case '5': return PAGE_UP;
+            case '6': return PAGE_DOWN;
+            case '7': return HOME_KEY;
+            case '8': return END_KEY;
           }
         } else if (seq[2] == ';') {
           if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
           if (read(STDIN_FILENO, &seq[4], 1) != 1) return '\x1b';
-          if (seq[3] == '5') {
-            if (seq[1] == '3' && seq[4] == '~') return CTRL_DEL_KEY;
-            switch (seq[4]) {
-              case 'A': return CTRL_ARROW_UP; case 'B': return CTRL_ARROW_DOWN;
-              case 'C': return CTRL_ARROW_RIGHT; case 'D': return CTRL_ARROW_LEFT;
+          if (seq[1] == '1') {
+            switch(seq[3]) {
+              case '2': // Shift
+                switch (seq[4]) {
+                  case 'H': return SHIFT_HOME_KEY;
+                  case 'F': return SHIFT_END_KEY;
+                  case 'A': return SHIFT_ARROW_UP; case 'B': return SHIFT_ARROW_DOWN;
+                  case 'C': return SHIFT_ARROW_RIGHT; case 'D': return SHIFT_ARROW_LEFT;
+                }
+                break;
+              case '5': // Ctrl
+                switch (seq[4]) {
+                  case 'A': return CTRL_ARROW_UP; case 'B': return CTRL_ARROW_DOWN;
+                  case 'C': return CTRL_ARROW_RIGHT; case 'D': return CTRL_ARROW_LEFT;
+                }
+                break;
+              case '6': // Ctrl + Shift
+                switch (seq[4]) {
+                  case 'C': return CTRL_SHIFT_ARROW_RIGHT;
+                  case 'D': return CTRL_SHIFT_ARROW_LEFT;
+                }
+                break;
             }
           }
         }
       } else {
         switch (seq[1]) {
-        case 'A': return ARROW_UP; case 'B': return ARROW_DOWN;
-        case 'C': return ARROW_RIGHT; case 'D': return ARROW_LEFT;
-        case 'H': return HOME_KEY; case 'F': return END_KEY;
+          case 'A': return ARROW_UP;
+          case 'B': return ARROW_DOWN;
+          case 'C': return ARROW_RIGHT;
+          case 'D': return ARROW_LEFT;
+          case 'H': return HOME_KEY;
+          case 'F': return END_KEY;
         }
       }
     } else if (seq[0] == 'O') {
       switch (seq[1]) {
-      case 'H': return HOME_KEY; case 'F': return END_KEY;
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
+        // This handles another common variant for Ctrl+Arrow
+        case 'c': return CTRL_ARROW_RIGHT; 
+        case 'd': return CTRL_ARROW_LEFT;
       }
     }
     return '\x1b';
@@ -532,7 +562,7 @@ void editorDrawRows(struct abuf *ab) {
     if (filerow >= E.numrows) {
       if (E.numrows == 0) {
         char *welcome_lines[] = {
-            "K 8 O 4", "", "A modern terminal editor.", "",
+            "K 8 O 4", "", "A terminal editor.", "",
             "Ctrl-S: Save | Ctrl-X: Quit | Ctrl-A: Select All | Ctrl-F: Find"
         };
         int num_lines = sizeof(welcome_lines)/sizeof(welcome_lines[0]);
@@ -726,27 +756,56 @@ void editorMoveCursor(int key) {
   int rowlen = row ? row->size : 0;
   if (E.cx > rowlen) E.cx = rowlen;
 }
+void editorMoveCursorWordWise(int key) {
+    erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    switch (key) {
+        case CTRL_SHIFT_ARROW_LEFT:
+            if (E.cx == 0) {
+                if (E.cy > 0) { E.cy--; E.cx = E.row[E.cy].size; }
+            } else {
+                row = &E.row[E.cy];
+                E.cx--;
+                while (E.cx > 0 && is_separator(row->chars[E.cx])) { E.cx--; }
+                while (E.cx > 0 && !is_separator(row->chars[E.cx - 1])) { E.cx--; }
+            }
+            break;
+        case CTRL_SHIFT_ARROW_RIGHT:
+            if (!row) break;
+            if (E.cx == row->size) {
+                if (E.cy < E.numrows - 1) { E.cy++; E.cx = 0; }
+            } else {
+                while (E.cx < row->size && !is_separator(row->chars[E.cx])) { E.cx++; }
+                while (E.cx < row->size && is_separator(row->chars[E.cx])) { E.cx++; }
+            }
+            break;
+    }
+}
 void editorStartOrExtendSelection(int key) {
     if (!E.selection_active) {
         E.selection_active = 1; E.sel_start_cy = E.cy; E.sel_start_cx = E.cx;
     }
-    int move_key;
+    
     switch(key) {
-        case CTRL_ARROW_UP:    move_key = ARROW_UP;    break;
-        case CTRL_ARROW_DOWN:  move_key = ARROW_DOWN;  break;
-        case CTRL_ARROW_LEFT:  move_key = ARROW_LEFT;  break;
-        case CTRL_ARROW_RIGHT: move_key = ARROW_RIGHT; break;
+        case SHIFT_ARROW_UP:    editorMoveCursor(ARROW_UP);    break;
+        case SHIFT_ARROW_DOWN:  editorMoveCursor(ARROW_DOWN);  break;
+        case SHIFT_ARROW_LEFT:  editorMoveCursor(ARROW_LEFT);  break;
+        case SHIFT_ARROW_RIGHT: editorMoveCursor(ARROW_RIGHT); break;
+        case SHIFT_HOME_KEY:    E.cx = 0; break;
+        case SHIFT_END_KEY:     if (E.cy < E.numrows) E.cx = E.row[E.cy].size; break;
+        case CTRL_SHIFT_ARROW_LEFT:
+        case CTRL_SHIFT_ARROW_RIGHT:
+            editorMoveCursorWordWise(key);
+            break;
         default: return; 
     }
-    editorMoveCursor(move_key);
     E.sel_end_cy = E.cy; E.sel_end_cx = E.cx;
 }
 void editorProcessKeypress() {
   static int quit_times = QUIT_TIMES;
   int c = editorReadKey();
   switch (c) {
-  case '\r': case CTRL_DEL_KEY: editorInsertNewline(); break;
-  case 24:
+  case '\r': editorInsertNewline(); break;
+  case 24: // Ctrl-X
     if (E.dirty && quit_times > 0) {
       editorSetStatusMessage("WARNING! File has unsaved changes. "
                              "Press Ctrl-X %d more times to quit.", quit_times);
@@ -755,30 +814,27 @@ void editorProcessKeypress() {
     write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3);
     write(STDOUT_FILENO, COLOR_RESET, strlen(COLOR_RESET)); exit(0);
     break;
-  case 1:
+  case 1: // Ctrl-A
     if (E.numrows > 0) {
         E.selection_active = 1; E.sel_start_cy = 0; E.sel_start_cx = 0;
         E.sel_end_cy = E.numrows - 1; E.sel_end_cx = E.row[E.numrows - 1].size;
     }
     break;
-  case 19: editorSave(); break;
-  case HOME_KEY: E.cx = 0; editorClearSelection(); break;
-  case END_KEY: if (E.cy < E.numrows) E.cx = E.row[E.cy].size; editorClearSelection(); break;
-  case 6: editorFind(); break;
-  case 5:
+  case 19: editorSave(); break; // Ctrl-S
+  case 6: editorFind(); break; // Ctrl-F
+  case 5: // Ctrl-E
     E.sidebar_visible = !E.sidebar_visible;
     E.editor_width = E.screencols - (E.sidebar_visible ? 25 : 5);
     break;
-  case BACKSPACE: case 8:
+  case HOME_KEY: E.cx = 0; editorClearSelection(); break;
+  case END_KEY: if (E.cy < E.numrows) E.cx = E.row[E.cy].size; editorClearSelection(); break;
+  
+  case BACKSPACE:
     if (E.selection_active) editorDeleteSelection(); else editorDelChar();
     break;
-  case DEL_KEY: case 10:
-    if (E.selection_active) {
-        editorDeleteSelection();
-    } else {
-        editorMoveCursor(ARROW_RIGHT);
-        editorDelChar();
-    }
+  case DEL_KEY:
+    if (E.selection_active) { editorDeleteSelection();
+    } else { editorMoveCursor(ARROW_RIGHT); editorDelChar(); }
     break;
   case PAGE_UP: case PAGE_DOWN: {
     editorClearSelection();
@@ -790,10 +846,23 @@ void editorProcessKeypress() {
   case ARROW_UP: case ARROW_DOWN: case ARROW_LEFT: case ARROW_RIGHT:
     editorClearSelection(); editorMoveCursor(c);
     break;
-  case CTRL_ARROW_UP: case CTRL_ARROW_DOWN: case CTRL_ARROW_LEFT: case CTRL_ARROW_RIGHT:
+  case CTRL_ARROW_LEFT: editorClearSelection(); E.cx = 0; break;
+  case CTRL_ARROW_RIGHT:
+    editorClearSelection();
+    if (E.cy < E.numrows) E.cx = E.row[E.cy].size;
+    break;
+  case CTRL_ARROW_UP:
+  case CTRL_ARROW_DOWN:
+    editorClearSelection();
+    editorMoveCursor(c == CTRL_ARROW_UP ? ARROW_UP : ARROW_DOWN);
+    break;
+
+  case SHIFT_ARROW_UP: case SHIFT_ARROW_DOWN: case SHIFT_ARROW_LEFT: case SHIFT_ARROW_RIGHT:
+  case SHIFT_HOME_KEY: case SHIFT_END_KEY:
+  case CTRL_SHIFT_ARROW_LEFT: case CTRL_SHIFT_ARROW_RIGHT:
     editorStartOrExtendSelection(c);
     break;
-  case 12: case '\x1b': editorClearSelection(); break;
+  case 12: case '\x1b': editorClearSelection(); break; // Ctrl-L (clear), ESC
   default: editorInsertChar(c); break;
   }
   quit_times = QUIT_TIMES;
