@@ -1,4 +1,3 @@
-
 // cc k8o4.c -o k8o4 -Wall -Wextra -pedantic -std=c99
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
