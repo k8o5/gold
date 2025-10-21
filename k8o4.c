@@ -1,3 +1,4 @@
+
 // cc k8o4.c -o k8o4 -Wall -Wextra -pedantic -std=c99
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
@@ -19,6 +20,7 @@
 #define VSCODE_CLI_VERSION "1.2.1"
 #define TAB_STOP 4
 #define QUIT_TIMES 2
+#define MAX_UNDO 1000
 #define PL_RIGHT_ARROW "\uE0B0"
 #define COLOR_BG            "\x1b[48;2;30;30;30m"
 #define COLOR_FG            "\x1b[38;2;212;212;212m"
@@ -60,12 +62,42 @@ typedef struct erow {
   int idx; int size; int rsize; char *chars; char *render;
   unsigned char *hl; int hl_open_comment;
 } erow;
+
+// Undo/Redo system
+enum undoType {
+  UNDO_INSERT_CHAR,
+  UNDO_DELETE_CHAR,
+  UNDO_INSERT_NEWLINE,
+  UNDO_DELETE_NEWLINE,
+  UNDO_DELETE_SELECTION,
+};
+
+typedef struct undoState {
+  enum undoType type;
+  int cy, cx;           // Position where change occurred
+  int prev_cy, prev_cx; // Cursor position before operation
+  char c;               // For single char operations
+  char *text;           // For multi-char/line operations
+  int text_len;
+  // For selection deletions
+  int sel_start_cy, sel_start_cx;
+  int sel_end_cy, sel_end_cx;
+  char **lines;         // Deleted lines content
+  int num_lines;
+  struct undoState *prev;
+  struct undoState *next;
+} undoState;
+
 struct editorConfig {
   int cx, cy; int rx; int rowoff; int coloff; int screenrows; int screencols;
   int numrows; erow *row; int dirty; char *filename; char statusmsg[80];
   time_t statusmsg_time; struct editorSyntax *syntax; struct termios orig_termios;
   int sidebar_visible; int editor_width; int selection_active;
   int sel_start_cy, sel_start_cx; int sel_end_cy, sel_end_cx;
+  undoState *undo_head;
+  undoState *undo_current;
+  int undo_count;
+  int in_undo;  // Flag to prevent recording undo during undo/redo
 };
 struct editorConfig E;
 char DYNAMIC_COLOR_STATUS_BG[32];
@@ -88,6 +120,13 @@ char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorMoveCursor(int key);
 void editorClearSelection();
 void editorStartOrExtendSelection(int key);
+
+// Undo system forward declarations
+void undoPush(enum undoType type, int cy, int cx, char c, char *text, int text_len);
+void undoFreeState(undoState *state);
+void editorUndo();
+void editorRedo();
+
 void die(const char *s) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
@@ -175,7 +214,6 @@ int editorReadKey() {
       switch (seq[1]) {
         case 'H': return HOME_KEY;
         case 'F': return END_KEY;
-        // This handles another common variant for Ctrl+Arrow
         case 'c': return CTRL_ARROW_RIGHT; 
         case 'd': return CTRL_ARROW_LEFT;
       }
@@ -353,7 +391,8 @@ void editorInsertRow(int at, char *s, size_t len) {
   E.row[at].rsize = 0; E.row[at].render = NULL; E.row[at].hl = NULL;
   E.row[at].hl_open_comment = 0;
   editorUpdateRow(&E.row[at]);
-  E.numrows++; E.dirty++;
+  E.numrows++; 
+  if (!E.in_undo) E.dirty++;
 }
 void editorFreeRow(erow *row) {
   free(row->render); free(row->chars); free(row->hl);
@@ -363,35 +402,431 @@ void editorDelRow(int at) {
   editorFreeRow(&E.row[at]);
   memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
   for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
-  E.numrows--; E.dirty++;
+  E.numrows--; 
+  if (!E.in_undo) E.dirty++;
 }
 void editorRowInsertChar(erow *row, int at, int c) {
   if (at < 0 || at > row->size) at = row->size;
   row->chars = realloc(row->chars, row->size + 2);
   memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
   row->size++; row->chars[at] = c;
-  editorUpdateRow(row); E.dirty++;
+  editorUpdateRow(row); 
+  if (!E.in_undo) E.dirty++;
 }
 void editorRowAppendString(erow *row, char *s, size_t len) {
   row->chars = realloc(row->chars, row->size + len + 1);
   memcpy(&row->chars[row->size], s, len);
   row->size += len; row->chars[row->size] = '\0';
-  editorUpdateRow(row); E.dirty++;
+  editorUpdateRow(row); 
+  if (!E.in_undo) E.dirty++;
 }
 void editorRowDelChar(erow *row, int at) {
   if (at < 0 || at >= row->size) return;
   memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
-  row->size--; editorUpdateRow(row); E.dirty++;
+  row->size--; editorUpdateRow(row); 
+  if (!E.in_undo) E.dirty++;
 }
+
+// Undo system implementation
+void undoFreeState(undoState *state) {
+  if (!state) return;
+  if (state->text) free(state->text);
+  if (state->lines) {
+    for (int i = 0; i < state->num_lines; i++) {
+      if (state->lines[i]) free(state->lines[i]);
+    }
+    free(state->lines);
+  }
+  free(state);
+}
+
+void undoClearRedo() {
+  // Clear all redo states (everything after current)
+  if (!E.undo_current) return;
+  undoState *next = E.undo_current->next;
+  while (next) {
+    undoState *tmp = next->next;
+    undoFreeState(next);
+    E.undo_count--;
+    next = tmp;
+  }
+  if (E.undo_current) E.undo_current->next = NULL;
+}
+
+void undoPush(enum undoType type, int cy, int cx, char c, char *text, int text_len) {
+  if (E.in_undo) return;  // Don't record undo during undo/redo operations
+  
+  undoState *state = malloc(sizeof(undoState));
+  state->type = type;
+  state->cy = cy;
+  state->cx = cx;
+  state->prev_cy = E.cy;
+  state->prev_cx = E.cx;
+  state->c = c;
+  state->text = NULL;
+  state->text_len = text_len;
+  state->lines = NULL;
+  state->num_lines = 0;
+  state->next = NULL;
+  
+  if (text && text_len > 0) {
+    state->text = malloc(text_len + 1);
+    memcpy(state->text, text, text_len);
+    state->text[text_len] = '\0';
+  }
+  
+  // For selection operations
+  if (type == UNDO_DELETE_SELECTION) {
+    state->sel_start_cy = E.sel_start_cy;
+    state->sel_start_cx = E.sel_start_cx;
+    state->sel_end_cy = E.sel_end_cy;
+    state->sel_end_cx = E.sel_end_cx;
+  }
+  
+  // Clear redo history
+  undoClearRedo();
+  
+  // Add to undo stack
+  if (E.undo_current) {
+    E.undo_current->next = state;
+    state->prev = E.undo_current;
+  } else {
+    state->prev = NULL;
+    E.undo_head = state;
+  }
+  E.undo_current = state;
+  E.undo_count++;
+  
+  // Limit undo stack size
+  while (E.undo_count > MAX_UNDO) {
+    undoState *old = E.undo_head;
+    E.undo_head = old->next;
+    if (E.undo_head) E.undo_head->prev = NULL;
+    undoFreeState(old);
+    E.undo_count--;
+  }
+}
+
+void undoPushSelectionDeletion() {
+  if (E.in_undo || !E.selection_active) return;
+  
+  // Save the deleted content
+  int start_cy = E.sel_start_cy;
+  int start_cx = E.sel_start_cx;
+  int end_cy = E.sel_end_cy;
+  int end_cx = E.sel_end_cx;
+  
+  undoState *state = malloc(sizeof(undoState));
+  state->type = UNDO_DELETE_SELECTION;
+  state->cy = start_cy;
+  state->cx = start_cx;
+  state->prev_cy = E.cy;
+  state->prev_cx = E.cx;
+  state->sel_start_cy = start_cy;
+  state->sel_start_cx = start_cx;
+  state->sel_end_cy = end_cy;
+  state->sel_end_cx = end_cx;
+  state->text = NULL;
+  state->text_len = 0;
+  state->c = 0;
+  state->next = NULL;
+  state->prev = NULL;
+  
+  // Save deleted lines
+  if (start_cy == end_cy) {
+    state->num_lines = 1;
+    state->lines = malloc(sizeof(char*));
+    int len = end_cx - start_cx;
+    state->lines[0] = malloc(len + 1);
+    memcpy(state->lines[0], &E.row[start_cy].chars[start_cx], len);
+    state->lines[0][len] = '\0';
+  } else {
+    state->num_lines = end_cy - start_cy + 1;
+    state->lines = malloc(sizeof(char*) * state->num_lines);
+    
+    // First line
+    erow *row = &E.row[start_cy];
+    int len = row->size - start_cx;
+    state->lines[0] = malloc(len + 1);
+    memcpy(state->lines[0], &row->chars[start_cx], len);
+    state->lines[0][len] = '\0';
+    
+    // Middle lines
+    for (int i = 1; i < state->num_lines - 1; i++) {
+      row = &E.row[start_cy + i];
+      state->lines[i] = malloc(row->size + 1);
+      memcpy(state->lines[i], row->chars, row->size);
+      state->lines[i][row->size] = '\0';
+    }
+    
+    // Last line
+    row = &E.row[end_cy];
+    state->lines[state->num_lines - 1] = malloc(end_cx + 1);
+    memcpy(state->lines[state->num_lines - 1], row->chars, end_cx);
+    state->lines[state->num_lines - 1][end_cx] = '\0';
+  }
+  
+  undoClearRedo();
+  
+  if (E.undo_current) {
+    E.undo_current->next = state;
+    state->prev = E.undo_current;
+  } else {
+    E.undo_head = state;
+  }
+  E.undo_current = state;
+  E.undo_count++;
+  
+  while (E.undo_count > MAX_UNDO) {
+    undoState *old = E.undo_head;
+    E.undo_head = old->next;
+    if (E.undo_head) E.undo_head->prev = NULL;
+    undoFreeState(old);
+    E.undo_count--;
+  }
+}
+
+void editorUndo() {
+  if (!E.undo_current) {
+    editorSetStatusMessage("Nothing to undo");
+    return;
+  }
+  
+  E.in_undo = 1;
+  undoState *state = E.undo_current;
+  
+  switch (state->type) {
+    case UNDO_INSERT_CHAR:
+      // Undo character insertion by deleting it
+      E.cy = state->cy;
+      E.cx = state->cx + 1;
+      if (E.cy < E.numrows) {
+        editorRowDelChar(&E.row[E.cy], state->cx);
+      }
+      E.cx = state->cx;
+      break;
+      
+    case UNDO_DELETE_CHAR:
+      // Undo character deletion by inserting it back
+      E.cy = state->cy;
+      E.cx = state->cx;
+      if (E.cy < E.numrows) {
+        editorRowInsertChar(&E.row[E.cy], state->cx, state->c);
+      }
+      break;
+      
+    case UNDO_INSERT_NEWLINE:
+      // Undo newline insertion
+      E.cy = state->cy + 1;
+      E.cx = 0;
+      if (E.cy < E.numrows && state->cy >= 0 && state->cy < E.numrows) {
+        erow *row = &E.row[E.cy];
+        editorRowAppendString(&E.row[state->cy], row->chars, row->size);
+        editorDelRow(E.cy);
+      }
+      E.cy = state->cy;
+      E.cx = state->cx;
+      break;
+      
+    case UNDO_DELETE_NEWLINE:
+      // Undo newline deletion by splitting the line
+      E.cy = state->cy;
+      E.cx = state->cx;
+      if (E.cy < E.numrows) {
+        erow *row = &E.row[E.cy];
+        editorInsertRow(E.cy + 1, &row->chars[state->cx], row->size - state->cx);
+        row = &E.row[E.cy];
+        row->size = state->cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+      }
+      break;
+      
+    case UNDO_DELETE_SELECTION:
+      // Restore deleted selection
+      if (state->num_lines == 1) {
+        E.cy = state->sel_start_cy;
+        E.cx = state->sel_start_cx;
+        if (E.cy < E.numrows) {
+          for (int i = 0; state->lines[0][i]; i++) {
+            editorRowInsertChar(&E.row[E.cy], E.cx + i, state->lines[0][i]);
+          }
+        }
+      } else {
+        // Multi-line restoration
+        E.cy = state->sel_start_cy;
+        E.cx = state->sel_start_cx;
+        if (E.cy < E.numrows) {
+          // Split current line
+          erow *row = &E.row[E.cy];
+          char *saved_end = NULL;
+          int saved_len = 0;
+          if (E.cx < row->size) {
+            saved_len = row->size - E.cx;
+            saved_end = malloc(saved_len + 1);
+            memcpy(saved_end, &row->chars[E.cx], saved_len);
+            saved_end[saved_len] = '\0';
+            row->size = E.cx;
+            row->chars[row->size] = '\0';
+            editorUpdateRow(row);
+          }
+          
+          // Insert first line fragment
+          for (int i = 0; state->lines[0][i]; i++) {
+            editorRowInsertChar(&E.row[E.cy], E.cx + i, state->lines[0][i]);
+          }
+          
+          // Insert middle complete lines
+          for (int i = 1; i < state->num_lines - 1; i++) {
+            editorInsertRow(E.cy + i, state->lines[i], strlen(state->lines[i]));
+          }
+          
+          // Insert last line
+          int last_idx = state->num_lines - 1;
+          editorInsertRow(E.cy + last_idx, state->lines[last_idx], strlen(state->lines[last_idx]));
+          
+          // Append saved end
+          if (saved_end) {
+            editorRowAppendString(&E.row[E.cy + last_idx], saved_end, saved_len);
+            free(saved_end);
+          }
+        }
+      }
+      E.cy = state->prev_cy;
+      E.cx = state->prev_cx;
+      break;
+  }
+  
+  E.undo_current = state->prev;
+  E.in_undo = 0;
+  editorSetStatusMessage("Undo");
+}
+
+void editorRedo() {
+  if (!E.undo_current) {
+    if (!E.undo_head) {
+      editorSetStatusMessage("Nothing to redo");
+      return;
+    }
+    E.undo_current = E.undo_head;
+  } else if (!E.undo_current->next) {
+    editorSetStatusMessage("Nothing to redo");
+    return;
+  } else {
+    E.undo_current = E.undo_current->next;
+  }
+  
+  E.in_undo = 1;
+  undoState *state = E.undo_current;
+  
+  switch (state->type) {
+    case UNDO_INSERT_CHAR:
+      // Redo character insertion
+      E.cy = state->cy;
+      E.cx = state->cx;
+      if (E.cy >= E.numrows) {
+        editorInsertRow(E.numrows, "", 0);
+      }
+      editorRowInsertChar(&E.row[E.cy], state->cx, state->c);
+      E.cx++;
+      break;
+      
+    case UNDO_DELETE_CHAR:
+      // Redo character deletion
+      E.cy = state->cy;
+      E.cx = state->cx + 1;
+      if (E.cy < E.numrows) {
+        editorRowDelChar(&E.row[E.cy], state->cx);
+      }
+      E.cx = state->cx;
+      break;
+      
+    case UNDO_INSERT_NEWLINE:
+      // Redo newline insertion
+      E.cy = state->cy;
+      E.cx = state->cx;
+      if (E.cy < E.numrows) {
+        erow *row = &E.row[E.cy];
+        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+        row = &E.row[E.cy];
+        row->size = E.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+      } else {
+        editorInsertRow(E.cy, "", 0);
+      }
+      E.cy++;
+      E.cx = 0;
+      break;
+      
+    case UNDO_DELETE_NEWLINE:
+      // Redo newline deletion
+      E.cy = state->cy + 1;
+      if (E.cy < E.numrows && state->cy >= 0 && state->cy < E.numrows) {
+        erow *row = &E.row[E.cy];
+        editorRowAppendString(&E.row[state->cy], row->chars, row->size);
+        editorDelRow(E.cy);
+      }
+      E.cy = state->cy;
+      E.cx = state->cx;
+      break;
+      
+    case UNDO_DELETE_SELECTION:
+      // Redo selection deletion
+      E.cy = state->sel_start_cy;
+      E.cx = state->sel_start_cx;
+      
+      if (state->num_lines == 1) {
+        if (E.cy < E.numrows) {
+          erow *row = &E.row[E.cy];
+          int len = state->sel_end_cx - state->sel_start_cx;
+          memmove(&row->chars[state->sel_start_cx], 
+                  &row->chars[state->sel_end_cx], 
+                  row->size - state->sel_end_cx + 1);
+          row->size -= len;
+          editorUpdateRow(row);
+        }
+      } else {
+        if (E.cy < E.numrows) {
+          erow *start_row = &E.row[state->sel_start_cy];
+          erow *end_row = &E.row[state->sel_end_cy];
+          int end_len = end_row->size - state->sel_end_cx;
+          start_row->chars = realloc(start_row->chars, state->sel_start_cx + end_len + 1);
+          memcpy(&start_row->chars[state->sel_start_cx], 
+                 &end_row->chars[state->sel_end_cx], end_len);
+          start_row->size = state->sel_start_cx + end_len;
+          start_row->chars[start_row->size] = '\0';
+          
+          for (int i = state->sel_end_cy; i > state->sel_start_cy; i--) {
+            editorDelRow(i);
+          }
+          editorUpdateRow(&E.row[state->sel_start_cy]);
+        }
+      }
+      break;
+  }
+  
+  E.in_undo = 0;
+  editorSetStatusMessage("Redo");
+}
+
 void editorDeleteSelection();
 void editorInsertChar(int c) {
   if (E.selection_active) editorDeleteSelection();
   if (E.cy == E.numrows) editorInsertRow(E.numrows, "", 0);
+  
+  // Save undo state
+  undoPush(UNDO_INSERT_CHAR, E.cy, E.cx, c, NULL, 0);
+  
   editorRowInsertChar(&E.row[E.cy], E.cx, c);
   E.cx++;
 }
 void editorInsertNewline() {
   if (E.selection_active) editorDeleteSelection();
+  
+  // Save undo state
+  undoPush(UNDO_INSERT_NEWLINE, E.cy, E.cx, 0, NULL, 0);
+  
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -409,9 +844,16 @@ void editorDelChar() {
   if (E.cx == 0 && E.cy == 0) return;
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
+    // Save undo state
+    char deleted_char = row->chars[E.cx - 1];
+    undoPush(UNDO_DELETE_CHAR, E.cy, E.cx - 1, deleted_char, NULL, 0);
+    
     editorRowDelChar(row, E.cx - 1);
     E.cx--;
   } else {
+    // Save undo state
+    undoPush(UNDO_DELETE_NEWLINE, E.cy - 1, E.row[E.cy - 1].size, 0, NULL, 0);
+    
     E.cx = E.row[E.cy - 1].size;
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
     editorDelRow(E.cy);
@@ -431,6 +873,10 @@ void editorClearSelection() { E.selection_active = 0; }
 void editorDeleteSelection() {
     if (!E.selection_active) return;
     editorNormalizeSelection();
+    
+    // Save undo state
+    undoPushSelectionDeletion();
+    
     E.cy = E.sel_start_cy; E.cx = E.sel_start_cx;
     erow *start_row = &E.row[E.sel_start_cy];
     erow *end_row = &E.row[E.sel_end_cy];
@@ -471,11 +917,16 @@ void editorOpen(char *filename) {
   FILE *fp = fopen(filename, "r");
   if (!fp) { if (errno != ENOENT) die("fopen"); return; }
   char *line = NULL; size_t linecap = 0; ssize_t linelen;
+  
+  // Don't record undo for initial file load
+  E.in_undo = 1;
   while ((linelen = getline(&line, &linecap, fp)) != -1) {
     while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
       linelen--;
     editorInsertRow(E.numrows, line, linelen);
   }
+  E.in_undo = 0;
+  
   free(line); fclose(fp); E.dirty = 0;
 }
 void editorSave() {
@@ -563,7 +1014,7 @@ void editorDrawRows(struct abuf *ab) {
       if (E.numrows == 0) {
         char *welcome_lines[] = {
             "K 8 O 4", "", "A terminal editor.", "",
-            "Ctrl-S: Save | Ctrl-X: Quit | Ctrl-A: Select All | Ctrl-F: Find"
+            "Ctrl-S: Save | Ctrl-X: Quit | Ctrl-Z: Undo | Ctrl-Y: Redo"
         };
         int num_lines = sizeof(welcome_lines)/sizeof(welcome_lines[0]);
         int start_y = E.screenrows / 3;
@@ -820,6 +1271,8 @@ void editorProcessKeypress() {
         E.sel_end_cy = E.numrows - 1; E.sel_end_cx = E.row[E.numrows - 1].size;
     }
     break;
+  case 26: editorUndo(); break; // Ctrl-Z
+  case 25: editorRedo(); break; // Ctrl-Y
   case 19: editorSave(); break; // Ctrl-S
   case 6: editorFind(); break; // Ctrl-F
   case 5: // Ctrl-E
@@ -872,6 +1325,10 @@ void initEditor() {
   E.row = NULL; E.dirty = 0; E.filename = NULL; E.statusmsg[0] = '\0';
   E.statusmsg_time = 0; E.syntax = NULL; E.sidebar_visible = 0;
   E.selection_active = 0;
+  E.undo_head = NULL;
+  E.undo_current = NULL;
+  E.undo_count = 0;
+  E.in_undo = 0;
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 3;
   E.editor_width = E.screencols - (E.sidebar_visible ? 25 : 5);
@@ -895,7 +1352,7 @@ int main(int argc, char *argv[]) {
   snprintf(DYNAMIC_COLOR_STATUS_BG, sizeof(DYNAMIC_COLOR_STATUS_BG), "\x1b[48;2;%d;%d;%dm", r, g, b);
   snprintf(DYNAMIC_COLOR_STATUS_FG_ARROW, sizeof(DYNAMIC_COLOR_STATUS_FG_ARROW), "\x1b[38;2;%d;%d;%dm", r, g, b);
   if (argc >= 2) { editorOpen(argv[1]); }
-  editorSetStatusMessage("HELP: Ctrl-S Save | Ctrl-X Quit | Ctrl-A Select All | Ctrl-F Find");
+  editorSetStatusMessage("HELP: Ctrl-S Save | Ctrl-X Quit | Ctrl-Z Undo | Ctrl-Y Redo");
   while (1) {
     editorRefreshScreen(); editorProcessKeypress();
   }
